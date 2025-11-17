@@ -1,0 +1,13 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Jupyter Notebook autosave
+*.ipynb_save
+
+# IPython
+profile_default/
+ipython_config.py
