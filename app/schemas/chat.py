@@ -22,6 +22,7 @@ class ChatRequestType(BaseModel):
                     "user": "안녕?"
                 }
         model_name (str, optional): 사용할 모델명 (지정하지 않으면 기본 모델 사용)
+        request_id (str, optional): 중단 요청 식별용 ID (FE의 타임스탬프(UUID))
 
     예시:
         {
@@ -29,9 +30,10 @@ class ChatRequestType(BaseModel):
             "model_name": "gemma:2b-it"
         }
     """
-    txt: Optional[str]
-    txt_dict: Optional[Dict[str, str]]
-    model_name: Optional[str]
+    txt: Optional[str] = None
+    txt_dict: Optional[Dict[str, str]] = None
+    model_name: Optional[str] = None
+    request_id: Optional[str] = None
 
 
 

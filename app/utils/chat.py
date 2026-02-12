@@ -1,6 +1,7 @@
 from typing import Dict, Any, AsyncGenerator
 
 from fastapi.responses import StreamingResponse
+from fastapi import Request
 
 from app.core.config import CLIENT
 from app.schemas.chat import ChatRequestType
@@ -82,7 +83,9 @@ class ChatResponse:
     def streaming(
             cls,
             raw_resp: AsyncGenerator[Dict[str, Any], None],
-            with_metadata: bool = False
+            with_metadata: bool = False,
+            request: Request = None,
+            request_id: str = None
         ) -> StreamingResponse:
         """
         LLM 응답(raw_resp)을 FastAPI StreamingResponse로 변환한다.
@@ -94,6 +97,10 @@ class ChatResponse:
                 마지막 응답 시 메타데이터를 포함할지 여부. 기본 False.
                 - False → content만 전송 (성능 최적화)
                 - True  → 마지막 chunk에서 {"done": true, "metadata": {...}} 직렬화 전송
+            request (Request, optional):
+                FastAPI Request 객체 (전역 상태 접근용)
+            request_id (str, optional):
+                중단 요청 식별용 ID
 
         Returns:
             StreamingResponse: text/event-stream
@@ -101,9 +108,13 @@ class ChatResponse:
         """
         # choose generator
         if with_metadata:
-            generator = cls._generator_with_metadata_tail(raw_resp)
+            generator = cls._generator_with_metadata_tail(
+                raw_resp, request, request_id
+            )
         else:
-            generator = cls._generator_only_txt(raw_resp)
+            generator = cls._generator_only_txt(
+                raw_resp, request, request_id
+            )
         
         return StreamingResponse(
             content=generator,
@@ -117,7 +128,9 @@ class ChatResponse:
     @classmethod
     async def _generator_only_txt(
             cls,
-            raw_resp: AsyncGenerator[Dict[str, Any], None]
+            raw_resp: AsyncGenerator[Dict[str, Any], None],
+            request: Request = None,
+            request_id: str = None
         ) -> AsyncGenerator[str, None]:
         """
         스트리밍 제너레이터 (텍스트만 전송).
@@ -126,6 +139,10 @@ class ChatResponse:
         Args:
             raw_resp (AsyncGenerator[Dict[str, Any], None]):
                 LLM이 생성한 스트리밍 응답 (dict 형태)
+            request (Request, optional):
+                FastAPI Request 객체
+            request_id (str, optional):
+                중단 요청 식별용 ID
 
         Yields:
             str: SSE 포맷으로 변환된 content 문자열
@@ -137,6 +154,13 @@ class ChatResponse:
             \n\n
         """
         async for chunk in raw_resp:
+            
+            # 중단 신호 체크
+            if request and request_id:
+                if request_id in request.app.state.stop_signal:
+                    request.app.state.stop_signal.discard(request_id)   # 신호 제거
+                    break   # 루프 종료 (연결 종료)
+
             yield SSEConverter.str_to_sse(
                 txt=chunk.get(ResponseKey.CONTENT, "")
             )
@@ -148,7 +172,9 @@ class ChatResponse:
     @classmethod
     async def _generator_with_metadata_tail(
             cls,
-            raw_resp: AsyncGenerator[Dict[str, Any], None]
+            raw_resp: AsyncGenerator[Dict[str, Any], None],
+            request: Request = None,
+            request_id: str = None
         ) -> AsyncGenerator[str, None]:
         """
         스트리밍 제너레이터 (텍스트 + 마지막에 메타데이터 전송).
@@ -157,6 +183,10 @@ class ChatResponse:
         Args:
             raw_resp (AsyncGenerator[Dict[str, Any], None]):
                 LLM이 생성한 스트리밍 응답 (dict 형태)
+            request (Request, optional):
+                FastAPI Request 객체
+            request_id (str, optional):
+                중단 요청 식별용 ID
 
         Yields:
             str:
@@ -176,6 +206,13 @@ class ChatResponse:
             \n\n
         """
         async for chunk in raw_resp:
+
+            # 중단 신호 체크 로직
+            if request and request_id:
+                if request_id in request.app.state.stop_signal:
+                    request.app.state.stop_signal.discard(request_id)
+                    break
+
             if chunk.get(ResponseKey.DONE, False):
                 yield SSEConverter.event_to_sse(event='done', data=chunk)
             else:

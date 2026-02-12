@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 
 from app.schemas.chat import ChatRequestType, ChatResponseType
@@ -48,7 +48,7 @@ async def api_chat(
 
     Args:
         req (ChatRequestType): LLM 요청 객체
-        bot (ChatBot, optional): LLM Bot 객체. Defaults to Depends(get_bot).
+        bot (AsyncChatBot, optional): LLM Bot 객체. Defaults to Depends(get_bot).
 
     Returns:
         ChatResponseType: content / metadata / done
@@ -74,7 +74,8 @@ async def api_chat(
     description="텍스트 chunk 단위로 스트리밍 전송. 성능 최적화된 기본 모드."
 )
 async def web_chat(
-        req: ChatRequestType, 
+        req: ChatRequestType,
+        request: Request,   # 전역 상태 접근용
         bot: AsyncChatBot = Depends(get_bot)
     ) -> StreamingResponse:
     """
@@ -90,7 +91,8 @@ async def web_chat(
 
     Args:
         req (ChatRequestType): LLM 요청 객체
-        bot (ChatBot, optional): LLM Bot 객체. Defaults to Depends(get_bot).
+        request (Request): FastAPI Request 객체 (전역 상태 접근용)
+        bot (AsyncChatBot, optional): LLM Bot 객체. Defaults to Depends(get_bot).
 
     Returns:
         StreamingResponse: text/event-stream
@@ -103,8 +105,13 @@ async def web_chat(
     """
     # Response 생성
     raw_resp = await ChatResponse.get(bot=bot, req=req, stream=True)
-    # streaming 출력
-    return ChatResponse.streaming(raw_resp, with_metadata=False)
+    # streaming 출력 - streaming 메서드에 request와 request_id 전달
+    return ChatResponse.streaming(
+        raw_resp, 
+        with_metadata=False,
+        request=request,
+        request_id=req.request_id
+    )
 
 
 
@@ -119,6 +126,7 @@ async def web_chat(
 )
 async def web_chat_with_metadata(
         req: ChatRequestType,
+        request: Request,
         bot: AsyncChatBot = Depends(get_bot)
     ) -> StreamingResponse:
     """
@@ -133,7 +141,8 @@ async def web_chat_with_metadata(
 
     Args:
         req (ChatRequestType): LLM 요청 객체
-        bot (ChatBot, optional): LLM Bot 객체. Defaults to Depends(get_bot).
+        request (Request): FastAPI Request 객체 (전역 상태 접근용)
+        bot (AsyncChatBot, optional): LLM Bot 객체. Defaults to Depends(get_bot).
 
     Returns:
         StreamingResponse: text/event-stream
@@ -157,4 +166,35 @@ async def web_chat_with_metadata(
     # Response 생성
     raw_resp = await ChatResponse.get(bot=bot, req=req, stream=True)
     # streaming 출력
-    return ChatResponse.streaming(raw_resp, with_metadata=True)
+    return ChatResponse.streaming(
+        raw_resp, 
+        with_metadata=True,
+        request=request,
+        request_id=req.request_id
+    )
+
+
+
+# -----------------------------------------------------
+# 4. Streaming 중단 요청 처리 API
+# >>> web_chat, web_chat_with_metadata 정지
+# -----------------------------------------------------
+@router.post("/stop_streaming")
+async def stop_generation(
+        req: ChatRequestType, 
+        request: Request
+    ):
+    """
+    작업 중단 로직:
+    - stop_signal(set)에 request_id를 등록
+    - streaming generator 루프에서 이를 감지하여 break 수행
+
+    Test:
+        1) 스트리밍 시작:
+           curl -N -X POST http://localhost:8030/v0/chat/web -H "Content-Type: application/json" -d '{"txt": "1부터 100까지 숫자를 세며 아주 긴 이야기해줘", "txt_dict": null, "model_name": "gemma:2b", "request_id": "test_stop_123"}'
+        2) 즉시 중단:
+           curl -X POST http://localhost:8030/v0/chat/stop_streaming -H "Content-Type: application/json" -d '{ "txt": null, "txt_dict": null, "model_name": null, "request_id": "test_stop_123"}'
+    """
+    if req.request_id:
+        request.app.state.stop_signal.add(req.request_id)
+    return {"ok":True}

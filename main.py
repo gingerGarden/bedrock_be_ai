@@ -23,9 +23,10 @@ bot = AsyncChatBot(backend=CLIENT)       # LLM Client
 # - 모든 엔드포인트(router)는 이 app 객체에 등록됨
 # - app.state에 bot 객체를 붙여서 전역 공유 가능
 app = FastAPI()
-
-# app의 전역 공유 객체
-app.state.bot = bot     # bot 객체
+# app의 전역 공유 객체 - bot 객체
+app.state.bot = bot
+# 중단 요청할 request_id를 저장하는 집합
+app.state.stop_signal = set()
 
 
 
