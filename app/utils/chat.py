@@ -153,17 +153,34 @@ class ChatResponse:
             data: 맑고 화창합니다.
             \n\n
         """
-        async for chunk in raw_resp:
-            
-            # 중단 신호 체크
-            if request and request_id:
-                if request_id in request.app.state.stop_signal:
-                    request.app.state.stop_signal.discard(request_id)   # 신호 제거
-                    break   # 루프 종료 (연결 종료)
 
-            yield SSEConverter.str_to_sse(
-                txt=chunk.get(ResponseKey.CONTENT, "")
-            )
+        # 중단 방식
+        """
+        출력 소비(consume)를 중단 시키는 방식
+        - 제너레이터 루프를 break하여 asyncio 환경에서 해당 요청을 담당하던 비동기 작업 종료
+        - 이때 kha 패키지와의 연결도 같이 닫히며, 서버측에서도 해당 스트리밍 요청에 대한 연산 중단
+        
+        - 해당 방식은 LLM 연산 자체를 kill하는 것이 아님
+            > LLM 내부에서는 이미 다음 토큰을 계산 중일 수 있음
+            > 그러나 결과를 더 이상 yield 하지 않음
+            > 클라이언트로 전송되지 않음
+            > 스트림 연결 닫힘
+        - 만약 LLM task를 강제 cancel하면 오히려 리소스/락 문제가 생길 수 있음
+        """
+        try:
+            async for chunk in raw_resp:
+                # 중단 신호 체크
+                if request and request_id:
+                    if request_id in request.app.state.stop_signal:
+                        # 여기서 break를 하면 finally로 이동함
+                        break
+                yield SSEConverter.str_to_sse(
+                    txt=chunk.get(ResponseKey.CONTENT, "")
+                )
+        finally:
+            # 루프가 정상 종료되든, 중단 신호로 break되든 discard하여 request_id 삭제(메모리 누수 방지)
+            if request and request_id:
+                request.app.state.stop_signal.discard(request_id)   # 신호 제거
 
 
     # -------------------------------------------------
@@ -205,17 +222,21 @@ class ChatResponse:
             }
             \n\n
         """
-        async for chunk in raw_resp:
-
-            # 중단 신호 체크 로직
-            if request and request_id:
-                if request_id in request.app.state.stop_signal:
-                    request.app.state.stop_signal.discard(request_id)
-                    break
-
+        try:
+            async for chunk in raw_resp:
+                # 중단 신호 체크 로직
+                if request and request_id:
+                    if request_id in request.app.state.stop_signal:
+                        break
             if chunk.get(ResponseKey.DONE, False):
-                yield SSEConverter.event_to_sse(event='done', data=chunk)
+                yield SSEConverter.event_to_sse(
+                    event='done', data=chunk
+                )
             else:
                 yield SSEConverter.str_to_sse(
                     txt=chunk.get(ResponseKey.CONTENT, "")
                 )
+        finally:
+            # 응답 완료 후 반드시 신호 제거
+            if request and request_id:
+                request.app.state.stop_signal.discard(request_id)
