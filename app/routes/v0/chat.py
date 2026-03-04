@@ -1,6 +1,9 @@
+import asyncio
+
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 
+from app.core.constants import DelayTime
 from app.schemas.chat import ChatRequestType, ChatResponseType
 from app.dependencies.chat import get_bot
 from app.utils.chat import ChatResponse
@@ -196,5 +199,22 @@ async def stop_generation(
            curl -X POST http://localhost:8030/v0/chat/stop_streaming -H "Content-Type: application/json" -d '{ "txt": null, "txt_dict": null, "model_name": null, "request_id": "test_stop_123"}'
     """
     if req.request_id:
-        request.app.state.stop_signal.add(req.request_id)
+
+        request_id = req.request_id
+        # 1. 중단 신호 추가
+        request.app.state.stop_signal.add(request_id)
+
+        # 2. 백그라운드 예약 삭제 로직 추가
+        # 스트리밍 제너레이터가 이미 끝났을 경우를 대비해 1분 뒤 강제 삭제
+        async def delayed_cleanup(
+                rid: str, 
+                delay: int = DelayTime.REQUEST_ID_CLAENUP
+            ):
+            await asyncio.sleep(delay)
+            # 이미 discard된 상태여도 에러가 나지 않음
+            request.app.state.stop_signal.discard(rid)
+
+        # 현재 루프에 태스크 등록 (응답은 즉시 반환됨)
+        asyncio.create_task(delayed_cleanup(request_id))
+
     return {"ok":True}

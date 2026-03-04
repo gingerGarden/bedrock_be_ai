@@ -228,14 +228,14 @@ class ChatResponse:
                 if request and request_id:
                     if request_id in request.app.state.stop_signal:
                         break
-            if chunk.get(ResponseKey.DONE, False):
-                yield SSEConverter.event_to_sse(
-                    event='done', data=chunk
-                )
-            else:
-                yield SSEConverter.str_to_sse(
-                    txt=chunk.get(ResponseKey.CONTENT, "")
-                )
+                if chunk.get(ResponseKey.DONE, False):
+                    yield SSEConverter.event_to_sse(
+                        event='done', data=chunk
+                    )
+                else:
+                    yield SSEConverter.str_to_sse(
+                        txt=chunk.get(ResponseKey.CONTENT, "")
+                    )
         finally:
             # 응답 완료 후 반드시 신호 제거
             if request and request_id:
