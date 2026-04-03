@@ -1,3 +1,6 @@
+import logging
+import asyncio
+
 from typing import Dict, Any, AsyncGenerator
 
 from fastapi.responses import StreamingResponse
@@ -14,26 +17,23 @@ from kha.schema.keys import ResponseKey
 from kha.schema.types import RawResponse
 
 
+logger = logging.getLogger(__name__)
+
+
 
 
 class ChatResponse:
     """
-    FastAPI ↔ KHA(ChatBot) 연결 유틸리티 클래스.
+    FastAPI와 KHA(LLM ChatBot)를 연결하는 핵심 유틸리티 클래스.
 
-    역할:
-    - FastAPI 엔드포인트에서 받은 요청을 KHA AsyncChatBot에 전달하고,
-      응답을 FastAPI가 처리할 수 있는 포맷(JSON or SSE stream)으로 변환한다.
-    - 스트리밍 / 비스트리밍 응답 모두 지원.
-    - SSE(Server-Sent Events) 형식으로 변환하여 실시간 전송 가능.
-
-    사용 시나리오:
-    - /api → 비스트리밍 (JSON 1회 반환)
-    - /web → 스트리밍 (텍스트만 반환)
-    - /web_with_meta → 스트리밍 (텍스트 + 마지막에 메타데이터 반환)
+    주요 역할:
+    1. 사용자의 요청(텍스트/딕셔너리)을 LLM이 이해할 수 있는 프롬프트로 변환.
+    2. LLM의 응답(비스트리밍/스트리밍)을 FastAPI의 응답 규격(JSON/SSE)으로 변환.
+    3. 예외 상황(백엔드 장애, 클라이언트 연결 끊김 등)에 대한 방어 로직 수행.
     """
 
     # -------------------------------------------------
-    # 1. LLM 호출 (Non-stream / Stream 공통)
+    # 1. LLM 호출 엔진 (Entry Point)
     # -------------------------------------------------
     @staticmethod
     async def get(
@@ -42,42 +42,62 @@ class ChatResponse:
             stream: bool
         ) -> RawResponse:
         """
-        ChatBot으로부터 원시 응답(raw_resp)을 가져온다.
+        ChatBot으로부터 원시 응답(Raw Response)을 가져오는 진입점 메서드.
 
-        처리 과정:
-        1. PromptStyle.get_prompt() → txt / txt_dict 입력을 정규화
-        2. bot(...) 호출 → AsyncChatBot 실행
-        3. raw_resp 반환 → dict(비스트리밍) 또는 generator(스트리밍)
+        [보안 및 안정성 강화 로직 포함]
+        - LLM 백엔드(Ollama/vLLM 등) 호출 중 발생하는 예외를 캡처하여 시스템 중단을 방지함.
+        - 에러 발생 시 사용자에게 친절한 에러 메시지를 제너레이터 또는 JSON 형태로 반환함.
 
         Args:
-            bot (AsyncChatBot): 전역으로 공유된 ChatBot 객체
-            req (ChatRequestType): 사용자 요청 (txt / txt_dict / model_name)
-            stream (bool): 스트리밍 여부
-                - False → dict 반환
-                - True  → AsyncGenerator 반환
+            bot: 전역 AsyncChatBot 인스턴스.
+            req: 사용자 요청 객체 (텍스트, 모델명, 요청 ID 포함).
+            stream: 스트리밍 모드 여부.
 
         Returns:
-            RawResponse:
-                - Non-stream → Dict[str, Any]
-                - Stream → AsyncGenerator[Dict[str, Any], None]
+            RawResponse: 비스트리밍 시 Dict, 스트리밍 시 AsyncGenerator 객체 반환.
         """
-        # 프롬프트 표준화 (txt / txt_dict → 통합 포맷)
-        prompt = PromptStyle.get_prompt(
-            txt=req.txt,
-            txt_dict=req.txt_dict,
-            style=CLIENT
-        )
-        # LLM 호출
-        response = await bot(
-            prompt=prompt,
-            model_name=req.model_name,
-            stream=stream
-        )
-        return response.raw_resp
+        try:
+            # 입력값 정규화 (프롬프트 스타일 적용)
+            prompt = PromptStyle.get_prompt(
+                txt=req.txt,
+                txt_dict=req.txt_dict,
+                style=CLIENT
+            )
+            # LLM 엔진 호출
+            response = await bot(
+                prompt=prompt,
+                model_name=req.model_name,
+                stream=stream
+            )
+            return response.raw_resp
+        
+        except Exception as e:
+            # 장애 발생 시 로깅 및 방어 응답 생성 - 갑작스러운 이유로 대화 중단
+            # TODO 로깅 추가 예정
+            print(f"[Error] LLM 호출 중 예외 발생: {e}")
+
+            if stream:
+                # 스트리밍 모드 : 에러 메시지를 흘려보낼 제너레이터 반환
+                async def error_gen(error_msg: str):
+                    """
+                    스트리밍 요청 중 에러 발생 시 호출되는 내부 비동기 제너레이터.
+                    - 주의: 호출 시 await를 붙이지 않고 제너레이터 객체 자체를 return함.
+                    """
+                    yield {
+                        ResponseKey.CONTENT: f"AI 모델 호출에 실패했습니다. (사유: {error_msg})", 
+                        ResponseKey.DONE: True
+                    }
+                return error_gen(error_msg=str(e))
+            else:
+                # 일반 모드 : 에러 정보를 담은 딕셔너리 반환
+                return {
+                    ResponseKey.CONTENT: "AI 모델 서비스가 일시적으로 원활하지 않습니다.", 
+                    "error_detail":str(e)
+                }
     
 
     # -------------------------------------------------
-    # 2. StreamingResponse 생성
+    # 2. FastAPI용 StreamingResponse 팩토리
     # -------------------------------------------------
     @classmethod
     def streaming(
@@ -88,42 +108,86 @@ class ChatResponse:
             request_id: str = None
         ) -> StreamingResponse:
         """
-        LLM 응답(raw_resp)을 FastAPI StreamingResponse로 변환한다.
+        LLM 원시 제너레이터를 FastAPI가 처리 가능한 StreamingResponse로 변환함.
 
         Args:
-            raw_resp (AsyncGenerator[Dict[str, Any], None]):
-                LLM이 생성한 스트리밍 응답 제너레이터
-            with_metadata (bool, optional):
-                마지막 응답 시 메타데이터를 포함할지 여부. 기본 False.
-                - False → content만 전송 (성능 최적화)
-                - True  → 마지막 chunk에서 {"done": true, "metadata": {...}} 직렬화 전송
-            request (Request, optional):
-                FastAPI Request 객체 (전역 상태 접근용)
-            request_id (str, optional):
-                중단 요청 식별용 ID
-
-        Returns:
-            StreamingResponse: text/event-stream
-                클라이언트와 SSE(Server-Sent Events) 방식으로 통신 가능
+            raw_resp: LLM 엔진이 생성한 비동기 제너레이터.
+            with_metadata: 응답 마지막에 실행 통계(토큰 수 등)를 포함할지 여부.
+            request: FastAPI Request 객체 (연결 끊김 감지용).
+            request_id: 중단 요청 추적용 고유 ID.
         """
-        # choose generator
-        if with_metadata:
-            generator = cls._generator_with_metadata_tail(
-                raw_resp, request, request_id
+        # 태스크 객체 저장 변수
+        watcher_task = None
+
+        # 1. 프로액티브 감시 태스크 (생명주기 관리 추가)
+        # 백그라운드 태스크로 실행 (응답 생성과 병렬로 수행)
+        if request and request_id:
+            watcher_task = asyncio.create_task(
+                cls._watch_disconnect(request, request_id)
             )
-        else:
-            generator = cls._generator_only_txt(
-                raw_resp, request, request_id
-            )
-        
+
+        # 2. 설정에 따른 제너레이터 선택 (텍스트만 or 메타데이터 포함)
+        base_gen = (
+            cls._generator_with_metadata_tail(raw_resp, request, request_id)
+            if with_metadata else
+            cls._generator_only_txt(raw_resp, request, request_id)
+        )
+
+        # 3. 라이프사이클 래퍼로 감싸서 반환
         return StreamingResponse(
-            content=generator,
+            content=cls._lifecycle_wrapper(
+                task=watcher_task, 
+                gen=base_gen,
+                request_id=request_id
+            ),
             media_type="text/event-stream"
         )
     
+    @classmethod
+    async def _watch_disconnect(
+            cls, 
+            request: Request, 
+            request_id: str
+        ):
+        try:
+            while True:
+                if await request.is_disconnected():
+                    # 연결 끊김 감지 시 즉시 stop_signal에 추가
+                    request.app.state.stop_signal.add(request_id)
+                    # TODO - 로거 추후 연결
+                    print(f"[Alert] Proactive disconnect detected: {request_id}")
+                    break
+                    
+                await asyncio.sleep(0.5)    # 0.5초 간격으로 체크
+        except asyncio.CancelledError:
+            # 스트리밍이 정상 종료되어 감시 태스크가 취소될 때 호출됨
+            pass
+        except Exception as e:
+            logger.error(f"Error in disconnect watcher: {e}")
+
+    @classmethod
+    async def _lifecycle_wrapper(
+            cls, 
+            task: None | asyncio.Task,  
+            gen: AsyncGenerator, 
+            request_id: str
+        ):
+        """
+        제너레이터를 감싸서 끝날 때 태스크 취소
+        """
+        try:
+            async for chunk in gen:
+                yield chunk
+        finally:
+            # 스트리밍이 끝나면 감시 태스크도 확실히 종료 (자원 회수)
+            if task and not task.done():
+                task.cancel()   # 제너레이터 끝나면 감시자도 종료
+                # TODO - 추후 로거 개발
+                print(f"Disconnect watcher cancelled for {request_id}")
+
 
     # -------------------------------------------------
-    # 3. 내부 generator: content만 전송
+    # 3. 내부 Generator: 텍스트 스트림 최적화 모드
     # -------------------------------------------------
     @classmethod
     async def _generator_only_txt(
@@ -133,8 +197,12 @@ class ChatResponse:
             request_id: str = None
         ) -> AsyncGenerator[str, None]:
         """
-        스트리밍 제너레이터 (텍스트만 전송).
-        - 코루틴을 반환해야하므로, streaming()에서 해당 메서드 앞엔 await가 붙지 않음
+        LLM 응답에서 텍스트(Content)만 추출하여 SSE 포맷으로 변환 및 송출함.
+
+        [자원 최적화 전략]
+        1. 클라이언트 연결 끊김 감지: 브라우저 종료 시 즉시 루프를 탈출하여 GPU 연산을 중단시킴.
+        2. 중단 신호(Stop Signal) 체크: 사용자 명시적 중단 요청 시 즉시 응답을 멈춤.
+        3. 메모리 관리: finally 블록을 통해 중단 신호 저장소(state.stop_signal)를 청소함.
 
         Args:
             raw_resp (AsyncGenerator[Dict[str, Any], None]):
@@ -169,22 +237,31 @@ class ChatResponse:
         """
         try:
             async for chunk in raw_resp:
-                # 중단 신호 체크
-                if request and request_id:
-                    if request_id in request.app.state.stop_signal:
-                        # 여기서 break를 하면 finally로 이동함
-                        break
+                
+                # 중단 체크
+                if await cls._should_stop(request, request_id):
+                    break
+
+                # SSE 규격으로 데이터 송출
                 yield SSEConverter.str_to_sse(
                     txt=chunk.get(ResponseKey.CONTENT, "")
                 )
+
+        except Exception as e:
+            # 생성 도중 예외 발생 시 클라이언트에 에러 노출
+            # TODO - 추후 로거 연결 필요
+            print(f"[Error] 스트리밍 생성 중 오류: {e}")
+            yield SSEConverter.str_to_sse(txt=f"\n\n[오류 발생: {str(e)}]")
+
         finally:
+            # [전략 3] 요청 완료/중단 후 시그널 제거 (메모리 누수 방지)
             # 루프가 정상 종료되든, 중단 신호로 break되든 discard하여 request_id 삭제(메모리 누수 방지)
             if request and request_id:
                 request.app.state.stop_signal.discard(request_id)   # 신호 제거
 
 
     # -------------------------------------------------
-    # 4. 내부 generator: content + 마지막에 metadata 전송
+    # 4. 내부 Generator: 텍스트 + 메타데이터 꼬리 모드
     # -------------------------------------------------
     @classmethod
     async def _generator_with_metadata_tail(
@@ -194,8 +271,8 @@ class ChatResponse:
             request_id: str = None
         ) -> AsyncGenerator[str, None]:
         """
-        스트리밍 제너레이터 (텍스트 + 마지막에 메타데이터 전송).
-        - 코루틴을 반환해야하므로, streaming()에서 해당 메서드 앞엔 await가 붙지 않음
+        텍스트를 스트리밍하고, 마지막 청크(DONE=True)에서 실행 정보를 포함하여 송출함.
+        - 파라미터 및 자원 최적화 로직은 _generator_only_txt와 동일함.
 
         Args:
             raw_resp (AsyncGenerator[Dict[str, Any], None]):
@@ -224,19 +301,45 @@ class ChatResponse:
         """
         try:
             async for chunk in raw_resp:
-                # 중단 신호 체크 로직
-                if request and request_id:
-                    if request_id in request.app.state.stop_signal:
-                        break
+                # 중단 체크
+                if await cls._should_stop(request, request_id):
+                    break
+                
+                # 청크 타입에 따른 SSE 이벤트 분기
                 if chunk.get(ResponseKey.DONE, False):
-                    yield SSEConverter.event_to_sse(
-                        event='done', data=chunk
-                    )
+                    # 마지막 정보(메타데이터)는 'done' 이벤트로 송출
+                    yield SSEConverter.event_to_sse(event='done', data=chunk)
                 else:
-                    yield SSEConverter.str_to_sse(
-                        txt=chunk.get(ResponseKey.CONTENT, "")
-                    )
+                    # 일반 텍스트 데이터 송출
+                    yield SSEConverter.str_to_sse(txt=chunk.get(ResponseKey.CONTENT, ""))
+
+        except Exception as e:
+            # TODO 로거 연결 필요
+            print(f"[Error] 스트리밍(메타) 생성 중 오류: {e}")
+            yield SSEConverter.str_to_sse(txt=f"\n\n[시스템 오류: {str(e)}]")
+
         finally:
-            # 응답 완료 후 반드시 신호 제거
+            # 요청 완료 후 시그널 제거
             if request and request_id:
                 request.app.state.stop_signal.discard(request_id)
+
+
+    @classmethod
+    async def _should_stop(cls, request: Request, request_id: str) -> bool:
+
+        if not request or not request_id:
+            return False
+        
+        # [판단 1] 클라이언트 연결 끊김 (브라우저 닫기 등)
+        if await request.is_disconnected():
+            # TODO - 추후 로거 연결 필요 (logger.warning)
+            print(f"[Info] Stop detected: Client connection lost. ID: {request_id}")
+            return True
+        
+        # [판단 2] 사용자 명시적 중단 신호 (stop_signal 전송됨)
+        if request_id in request.app.state.stop_signal:
+            # TODO - 추후 로더 연결 필요 (logger.info)
+            print(f"[Info] Stop detected: User interruption signal. ID: {request_id}")
+            return True
+        
+        return False
